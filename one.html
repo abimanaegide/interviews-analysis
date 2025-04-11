@@ -1,0 +1,382 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import io
+import matplotlib.pyplot as plt
+import datetime
+from data_processor import load_data, validate_data, preprocess_data
+from theme_analyzer import extract_themes, count_questions_per_theme
+from visualizations import (
+    plot_theme_distribution, 
+    plot_question_distribution, 
+    create_word_cloud, 
+    create_comparison_chart
+)
+from export_utils import generate_excel_report, generate_csv_report, generate_pdf_report
+import database as db
+
+# Set page title and configuration
+st.set_page_config(
+    page_title="Interview Data Analysis Tool",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Main title and description
+st.title("Interview Data Analysis Tool")
+st.markdown("""
+This tool analyzes interview data from three different groups to identify common themes 
+and count question repetitions per theme. Upload your data or load a previous analysis.
+""")
+
+# App state tracking
+if 'data_processed' not in st.session_state:
+    st.session_state.data_processed = False
+if 'all_data' not in st.session_state:
+    st.session_state.all_data = {}
+if 'themes' not in st.session_state:
+    st.session_state.themes = {}
+if 'question_counts' not in st.session_state:
+    st.session_state.question_counts = {}
+if 'current_project_id' not in st.session_state:
+    st.session_state.current_project_id = None
+if 'projects' not in st.session_state:
+    st.session_state.projects = db.load_projects()
+
+# Sidebar tabs for data input options
+st.sidebar.title("Data Input")
+data_tab1, data_tab2 = st.sidebar.tabs(["Upload New Data", "Load Saved Analysis"])
+
+# Upload tab
+with data_tab1:
+    st.header("Upload Interview Data")
+    
+    # File upload for the three groups
+    uploaded_files = {}
+    for group_name in ["Group 1", "Group 2", "Group 3"]:
+        uploaded_file = st.file_uploader(
+            f"Upload {group_name} data (CSV or Excel)",
+            type=["csv", "xlsx"],
+            key=f"upload_{group_name.lower().replace(' ', '_')}"
+        )
+        if uploaded_file is not None:
+            uploaded_files[group_name] = uploaded_file
+    
+    # Analysis parameters
+    st.header("Analysis Parameters")
+    
+    # Project name for saving
+    project_name = st.text_input(
+        "Project Name",
+        value=f"Interview Analysis {datetime.datetime.now().strftime('%Y-%m-%d')}"
+    )
+    
+    project_description = st.text_area(
+        "Project Description",
+        value="Analysis of interview data from three groups."
+    )
+    
+    min_theme_freq = st.slider(
+        "Minimum theme frequency", 
+        min_value=1, 
+        max_value=20, 
+        value=3,
+        help="Minimum number of occurrences required to consider a topic as a theme"
+    )
+    
+    theme_extraction_method = st.selectbox(
+        "Theme extraction method",
+        ["TF-IDF Clustering", "Keyword Extraction", "Topic Modeling"],
+        help="Method used to extract themes from the interview data"
+    )
+    
+    num_themes = st.slider(
+        "Number of themes to extract", 
+        min_value=3, 
+        max_value=15, 
+        value=5,
+        help="Maximum number of themes to identify in the data"
+    )
+    
+    # Process button
+    if st.button("Process Interview Data"):
+        if not uploaded_files:
+            st.error("Please upload at least one data file.")
+        else:
+            with st.spinner("Processing interview data..."):
+                # Dictionary to store dataframes
+                all_dfs = {}
+                
+                # Process each uploaded file
+                for group_name, file in uploaded_files.items():
+                    df = load_data(file)
+                    
+                    # Validate the dataframe structure
+                    if not validate_data(df):
+                        st.error(f"Invalid data format in {group_name} file. Please check the sample format.")
+                        st.stop()
+                    
+                    # Preprocess the data
+                    df = preprocess_data(df)
+                    all_dfs[group_name] = df
+                    
+                    # Save to database
+                    db.save_interview_data(df, group_name)
+                
+                # Store all data in session state
+                st.session_state.all_data = all_dfs
+                
+                # Extract themes from all data combined
+                combined_df = pd.concat(list(all_dfs.values()))
+                themes = extract_themes(
+                    combined_df, 
+                    method=theme_extraction_method, 
+                    min_freq=min_theme_freq,
+                    num_themes=num_themes
+                )
+                st.session_state.themes = themes
+                
+                # Count question repetitions per theme for each group
+                question_counts = {}
+                for group_name, df in all_dfs.items():
+                    question_counts[group_name] = count_questions_per_theme(df, themes)
+                
+                st.session_state.question_counts = question_counts
+                
+                # Save analysis project to database
+                project_id = db.save_analysis_project(
+                    project_name,
+                    project_description,
+                    min_theme_freq,
+                    num_themes,
+                    theme_extraction_method
+                )
+                
+                # Save themes and distributions
+                if project_id:
+                    theme_ids = db.save_themes(themes, theme_extraction_method)
+                    db.save_theme_distribution(theme_ids, all_dfs, themes)
+                    db.save_question_counts(theme_ids, question_counts)
+                    
+                    # Update current project ID
+                    st.session_state.current_project_id = project_id
+                    
+                    # Reload projects list
+                    st.session_state.projects = db.load_projects()
+                
+                st.session_state.data_processed = True
+                st.success("Data processed and saved successfully!")
+    
+    # Sample data format button
+    if st.button("Show Sample Data Format"):
+        st.markdown("### Sample Data Format")
+        st.markdown("""
+        Your file should have at least these columns:
+        - `question`: The interview question
+        - `response`: The interviewee's response
+        - `respondent_id`: Unique identifier for each respondent
+        """)
+        
+        # Display sample CSV download link
+        with open("sample_data_format.csv", "r") as f:
+            st.download_button(
+                label="Download Sample CSV",
+                data=f,
+                file_name="sample_data_format.csv",
+                mime="text/csv"
+            )
+
+# Load saved analysis tab
+with data_tab2:
+    st.header("Load Saved Analysis")
+    
+    # Refresh button
+    if st.button("Refresh Project List"):
+        st.session_state.projects = db.load_projects()
+    
+    # Show saved projects
+    if st.session_state.projects:
+        project_options = {f"{p['name']} (ID: {p['id']})": p['id'] for p in st.session_state.projects}
+        selected_project = st.selectbox(
+            "Select a saved analysis",
+            options=list(project_options.keys()),
+            index=0
+        )
+        
+        selected_project_id = project_options[selected_project]
+        
+        # Load button
+        if st.button("Load Selected Analysis"):
+            with st.spinner("Loading analysis data..."):
+                all_data, themes, question_counts, project_info = db.load_project_data(selected_project_id)
+                
+                if all_data and themes and question_counts:
+                    # Update session state
+                    st.session_state.all_data = all_data
+                    st.session_state.themes = themes
+                    st.session_state.question_counts = question_counts
+                    st.session_state.data_processed = True
+                    st.session_state.current_project_id = selected_project_id
+                    
+                    st.success(f"Analysis '{project_info['name']}' loaded successfully!")
+                else:
+                    st.error("Failed to load analysis data. Please try again.")
+        
+        # Delete button
+        if st.button("Delete Selected Analysis"):
+            if st.session_state.current_project_id == selected_project_id:
+                st.error("Cannot delete the currently loaded analysis.")
+            else:
+                if db.delete_project(selected_project_id):
+                    st.session_state.projects = db.load_projects()
+                    st.success("Analysis deleted successfully!")
+                else:
+                    st.error("Failed to delete analysis. Please try again.")
+    else:
+        st.info("No saved analyses found. Process new data to create an analysis.")
+
+# Display results if data has been processed
+if st.session_state.data_processed:
+    st.header("Analysis Results")
+    
+    # Tabs for different views
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Theme Overview", 
+        "Question Repetitions", 
+        "Group Comparison", 
+        "Export Results"
+    ])
+    
+    with tab1:
+        st.subheader("Identified Themes")
+        
+        # Display themes with word cloud
+        col1, col2 = st.columns([1, 2])
+        
+        with col1:
+            st.markdown("### Key Themes")
+            for theme_name, keywords in st.session_state.themes.items():
+                with st.expander(theme_name):
+                    st.write("Keywords: " + ", ".join(keywords))
+        
+        with col2:
+            st.markdown("### Theme Visualization")
+            # Create and display word cloud of themes
+            word_cloud_fig = create_word_cloud(st.session_state.themes)
+            st.pyplot(word_cloud_fig)
+        
+        # Theme distribution chart
+        st.markdown("### Theme Distribution Across Groups")
+        theme_dist_fig = plot_theme_distribution(
+            st.session_state.all_data, 
+            st.session_state.themes
+        )
+        st.pyplot(theme_dist_fig)
+    
+    with tab2:
+        st.subheader("Question Repetitions by Theme")
+        
+        # Filter options
+        selected_theme = st.selectbox(
+            "Select Theme", 
+            list(st.session_state.themes.keys())
+        )
+        
+        selected_groups = st.multiselect(
+            "Select Groups",
+            list(st.session_state.question_counts.keys()),
+            default=list(st.session_state.question_counts.keys())
+        )
+        
+        # Question distribution chart
+        if selected_theme and selected_groups:
+            question_dist_fig = plot_question_distribution(
+                {group: counts for group, counts in st.session_state.question_counts.items() 
+                 if group in selected_groups},
+                selected_theme
+            )
+            st.pyplot(question_dist_fig)
+        else:
+            st.info("Please select at least one theme and one group to display question distribution.")
+    
+    with tab3:
+        st.subheader("Group Comparison")
+        
+        # Method selection
+        comparison_method = st.radio(
+            "Comparison Method",
+            ["Theme Prevalence", "Question Distribution", "Response Length"]
+        )
+        
+        # Generate and display comparison chart
+        comparison_fig = create_comparison_chart(
+            st.session_state.all_data,
+            st.session_state.themes,
+            st.session_state.question_counts,
+            method=comparison_method
+        )
+        st.pyplot(comparison_fig)
+    
+    with tab4:
+        st.subheader("Export Analysis Results")
+        
+        # Export format selection
+        export_format = st.radio(
+            "Export Format",
+            ["Excel (.xlsx)", "CSV (.csv)", "PDF (.pdf)"]
+        )
+        
+        # Generate report based on selected format
+        if st.button("Generate Report"):
+            with st.spinner("Generating report..."):
+                if export_format == "Excel (.xlsx)":
+                    report_bytes = generate_excel_report(
+                        st.session_state.all_data,
+                        st.session_state.themes,
+                        st.session_state.question_counts
+                    )
+                    st.download_button(
+                        label="Download Excel Report",
+                        data=report_bytes,
+                        file_name="interview_analysis_report.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                elif export_format == "CSV (.csv)":
+                    report_bytes = generate_csv_report(
+                        st.session_state.all_data,
+                        st.session_state.themes,
+                        st.session_state.question_counts
+                    )
+                    st.download_button(
+                        label="Download CSV Report",
+                        data=report_bytes,
+                        file_name="interview_analysis_report.csv",
+                        mime="text/csv"
+                    )
+                elif export_format == "PDF (.pdf)":
+                    report_bytes = generate_pdf_report(
+                        st.session_state.all_data,
+                        st.session_state.themes,
+                        st.session_state.question_counts
+                    )
+                    st.download_button(
+                        label="Download PDF Report",
+                        data=report_bytes,
+                        file_name="interview_analysis_report.pdf",
+                        mime="application/pdf"
+                    )
+
+# Show instructions if no files have been uploaded yet
+else:
+    if not uploaded_files:
+        st.info("""
+        ### How to use this tool:
+        1. Upload interview data for each group using the sidebar
+        2. Adjust analysis parameters if needed
+        3. Click 'Process Interview Data' to analyze
+        4. Explore themes, question repetitions, and group comparisons
+        5. Export your analysis results as needed
+        
+        Need a sample format? Click 'Show Sample Data Format' in the sidebar.
+        """)
